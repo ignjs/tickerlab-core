@@ -26,7 +26,13 @@ def save_frame(df: pl.DataFrame, path: Path, export: str = "parquet") -> Path:
     return path
 
 
+def save_dataset(base: Path, name: str, symbol: str, timeframe: str, df: pl.DataFrame, export: str = "parquet") -> Path:
+    path = dataset_path(base, name, symbol, timeframe, export)
+    return save_frame(df, path, export=export)
+
+
 def load_frame(path: Path) -> pl.DataFrame:
+
     if path.suffix == ".parquet":
         return pl.read_parquet(path)
     if path.suffix == ".csv":

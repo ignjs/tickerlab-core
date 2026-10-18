@@ -296,3 +296,177 @@ def analyze_ticker(
         "score_now": score_now,
         "message": None,
     }
+
+def run_ingest(
+    symbol: str,
+    timeframe: str = "1d",
+    source: str = "synthetic",
+    input_path: str | None = None,
+    cache_dir: Path = Path("data"),
+    export: str = "parquet",
+    seed: int | None = None,
+    period: str = "max",
+) -> pl.DataFrame:
+    """Orquesta la ingesta de datos y los persiste en disco."""
+    from tickerlab.ingest.service import load_from_csv, load_from_yahoo, load_synthetic
+    from tickerlab.storage.io import save_dataset
+
+    if source == "csv":
+        if not input_path:
+            raise ValueError("--input-path es requerido cuando source=csv")
+        bars = load_from_csv(input_path, symbol=symbol, timeframe=timeframe)
+    elif source in {"yahoo", "yfinance"}:
+        bars = load_from_yahoo(symbol=symbol, timeframe=timeframe, period=period)
+    else:
+        bars = load_synthetic(symbol=symbol, timeframe=timeframe, seed=seed)
+
+    save_dataset(cache_dir, "bars", symbol, timeframe, bars, export=export)
+    return bars
+
+
+def run_features(
+    symbol: str,
+    timeframe: str = "1d",
+    cache_dir: Path = Path("data"),
+    export: str = "parquet",
+) -> pl.DataFrame:
+    """Orquesta la construcción de features y los persiste."""
+    from tickerlab.storage.io import load_frame, save_dataset
+
+    bars = load_frame(dataset_path(cache_dir, "bars", symbol, timeframe))
+    feats = build_features(bars)
+    save_dataset(cache_dir, "features", symbol, timeframe, feats, export=export)
+    return feats
+
+
+def run_patterns(
+    symbol: str,
+    timeframe: str = "1d",
+    engine: str = "structural",
+    cache_dir: Path = Path("data"),
+    export: str = "parquet",
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Orquesta la detección de pivots y patrones."""
+    from tickerlab.storage.io import load_frame, save_dataset
+
+    if engine != "structural":
+        raise ValueError("Engine soportado en V1 mínima: structural")
+
+    bars = load_frame(dataset_path(cache_dir, "bars", symbol, timeframe))
+    piv = detect_pivots(bars, window=3)
+    events = scan_structural(piv, tolerance=0.01)
+
+    save_dataset(cache_dir, "pivots", symbol, timeframe, piv, export=export)
+    save_dataset(cache_dir, "events", symbol, timeframe, events, export=export)
+    return piv, events
+
+
+def run_labels(
+    symbol: str,
+    timeframe: str = "1d",
+    horizons: str = "1,3,5,10,20,60",
+    cache_dir: Path = Path("data"),
+    export: str = "parquet",
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Orquesta la generación de etiquetas multi-horizonte."""
+    from tickerlab.storage.io import load_frame, save_dataset
+
+    hs = [int(x.strip()) for x in horizons.split(",") if x.strip()]
+    bars = load_frame(dataset_path(cache_dir, "bars", symbol, timeframe))
+    events = load_frame(dataset_path(cache_dir, "events", symbol, timeframe))
+
+    lab_bar = build_bar_labels(bars, horizons=hs)
+    lab_event = build_event_labels(bars, events, horizons=hs)
+
+    save_dataset(cache_dir, "labels_bar", symbol, timeframe, lab_bar, export=export)
+    save_dataset(cache_dir, "labels_event", symbol, timeframe, lab_event, export=export)
+    return lab_bar, lab_event
+
+
+def run_validate(
+    symbol: str,
+    timeframe: str = "1d",
+    model: str = "logistic",
+    mode: str = "rolling",
+    horizon: int = 5,
+    cache_dir: Path = Path("data"),
+    export: str = "parquet",
+) -> dict[str, Any]:
+    """Orquesta la validación Walk-Forward y persiste el summary."""
+    from tickerlab.storage.io import load_frame, save_dataset
+    from tickerlab.utils.dataset import as_xy, event_dataset
+
+    if model != "logistic":
+        raise ValueError("Modelo soportado en V1 mínima: logistic")
+    if mode not in {"rolling", "expanding"}:
+        raise ValueError("mode debe ser rolling o expanding")
+
+    feats = load_frame(dataset_path(cache_dir, "features", symbol, timeframe))
+    events = load_frame(dataset_path(cache_dir, "events", symbol, timeframe))
+    labels_event = load_frame(dataset_path(cache_dir, "labels_event", symbol, timeframe))
+
+    ds = event_dataset(feats, events, labels_event, horizon=horizon)
+    X, y, fr, sub = as_xy(ds)
+
+    if len(y) < 20:
+        raise ValueError("Muy pocos eventos válidos para walk-forward")
+
+    folds = list(walk_forward_indices(len(y), mode=mode, train_size=50, test_size=20, n_splits=5, purge=1))
+    fold_rows = []
+    aucs = []
+    for i, fold in enumerate(folds):
+        Xtr, ytr = X[fold.train_idx], y[fold.train_idx]
+        Xte, yte = X[fold.test_idx], y[fold.test_idx]
+        frte = fr[fold.test_idx]
+        clf = fit_logistic(Xtr, ytr)
+        prob = clf.predict_proba(Xte)[:, 1]
+        m = compute_signal_metrics(yte, prob, frte)
+        aucs.append(m["auc"])
+        fold_rows.append({"fold": i, **m})
+
+    summary = compute_signal_metrics(y, fit_logistic(X, y).predict_proba(X)[:, 1], fr)
+    summary["stability_score"] = stability_score([x for x in aucs if x == x])
+
+    save_dataset(cache_dir, "validation_folds", symbol, timeframe, pl.DataFrame(fold_rows), export=export)
+    save_dataset(cache_dir, "validation_summary", symbol, timeframe, pl.DataFrame([summary]), export=export)
+
+    return {
+        "summary": summary,
+        "rows": sub.height,
+        "path": dataset_path(cache_dir, "validation_summary", symbol, timeframe),
+    }
+
+
+def run_score(
+    symbol: str,
+    timeframe: str = "1d",
+    horizon: int = 5,
+    cache_dir: Path = Path("data"),
+) -> float:
+    """Calcula el score predictivo actual basándose en los datos guardados."""
+    from tickerlab.storage.io import load_frame
+    from tickerlab.utils.dataset import as_xy, event_dataset
+
+    feats = load_frame(dataset_path(cache_dir, "features", symbol, timeframe))
+    events = load_frame(dataset_path(cache_dir, "events", symbol, timeframe))
+    labels_event = load_frame(dataset_path(cache_dir, "labels_event", symbol, timeframe))
+    ds = event_dataset(feats, events, labels_event, horizon=horizon)
+    X, y, _, sub = as_xy(ds)
+    model = fit_logistic(X, y)
+    feature_cols = [
+        c
+        for c in sub.columns
+        if c in [
+            "ret_1",
+            "ret_5",
+            "ema_ratio",
+            "range_pct",
+            "zscore_20",
+            "vol_ratio_20",
+            "rsi_14",
+            "drawdown_20",
+            "realized_vol_20",
+        ]
+    ]
+    latest = sub.select(feature_cols).tail(1).to_numpy()
+    return float(model.predict_proba(latest)[:, 1][0])

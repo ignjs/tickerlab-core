@@ -40,11 +40,10 @@ app.add_typer(score_app, name="score")
 app.add_typer(report_app, name="report")
 
 
-def _save(cache_dir: Path, name: str, symbol: str, timeframe: str, df: pl.DataFrame, export: str = "parquet") -> Path:
+def _save_core(cache_dir: Path, name: str, symbol: str, timeframe: str, df: pl.DataFrame, export: str = "parquet") -> Path:
     path = dataset_path(cache_dir, name, symbol, timeframe, export)
     save_frame(df, path, export=export)
     return path
-
 
 @app.command()
 def ingest(
@@ -63,49 +62,65 @@ def ingest(
     input_path = input_path or cfg.ingest.input_path
     seed = seed if seed is not None else cfg.ingest.seed
     period = period or cfg.ingest.period
-    if source == "csv":
-        if not input_path:
-            raise typer.BadParameter("--input-path es requerido cuando source=csv")
-        bars = load_from_csv(input_path, symbol=symbol, timeframe=timeframe)
-    elif source in {"yahoo", "yfinance"}:
-        bars = load_from_yahoo(symbol=symbol, timeframe=timeframe, period=period)
-    else:
-        bars = load_synthetic(symbol=symbol, timeframe=timeframe, seed=seed)
-    path = _save(Path(cache_dir), "bars", symbol, timeframe, bars, export=export)
-    typer.echo(f"ingested={bars.height} path={path}")
+    
+    try:
+        bars = analyze_ticker.run_ingest(
+            symbol=symbol,
+            timeframe=timeframe,
+            source=source,
+            input_path=input_path,
+            cache_dir=Path(cache_dir),
+            export=export,
+            seed=seed,
+            period=period
+        )
+        typer.echo(f"ingested={bars.height}")
+    except Exception as e:
+        raise typer.BadParameter(str(e))
 
 
 @features_app.command("build")
 def features_build(symbol: str = "AAPL", timeframe: str = "1d", cache_dir: str = "data", export: str = "parquet"):
-    bars = load_frame(dataset_path(Path(cache_dir), "bars", symbol, timeframe))
-    feats = build_features(bars)
-    path = _save(Path(cache_dir), "features", symbol, timeframe, feats, export=export)
-    typer.echo(f"features={feats.height} path={path}")
+    try:
+        feats = analyze_ticker.run_features(
+            symbol=symbol,
+            timeframe=timeframe,
+            cache_dir=Path(cache_dir),
+            export=export
+        )
+        typer.echo(f"features={feats.height}")
+    except Exception as e:
+        raise typer.BadParameter(str(e))
 
 
 @patterns_app.command("scan")
 def patterns_scan(symbol: str = "AAPL", timeframe: str = "1d", engine: str = "structural", cache_dir: str = "data", export: str = "parquet"):
-    if engine != "structural":
-        raise typer.BadParameter("Engine soportado en V1 mínima: structural")
-    bars = load_frame(dataset_path(Path(cache_dir), "bars", symbol, timeframe))
-    piv = detect_pivots(bars, window=3)
-    events = scan_structural(piv, tolerance=0.01)
-    _save(Path(cache_dir), "pivots", symbol, timeframe, piv, export=export)
-    path = _save(Path(cache_dir), "events", symbol, timeframe, events, export=export)
-    typer.echo(f"events={events.height} path={path}")
+    try:
+        piv, events = analyze_ticker.run_patterns(
+            symbol=symbol,
+            timeframe=timeframe,
+            engine=engine,
+            cache_dir=Path(cache_dir),
+            export=export
+        )
+        typer.echo(f"events={events.height}")
+    except Exception as e:
+        raise typer.BadParameter(str(e))
 
 
 @labels_app.command("build")
 def labels_build(symbol: str = "AAPL", timeframe: str = "1d", horizons: str = "1,3,5,10,20,60", cache_dir: str = "data", export: str = "parquet"):
-    hs = [int(x.strip()) for x in horizons.split(",") if x.strip()]
-    bars = load_frame(dataset_path(Path(cache_dir), "bars", symbol, timeframe))
-    events = load_frame(dataset_path(Path(cache_dir), "events", symbol, timeframe))
-    lab_bar = build_bar_labels(bars, horizons=hs)
-    lab_event = build_event_labels(bars, events, horizons=hs)
-    path_b = _save(Path(cache_dir), "labels_bar", symbol, timeframe, lab_bar, export=export)
-    path_e = _save(Path(cache_dir), "labels_event", symbol, timeframe, lab_event, export=export)
-    typer.echo(f"labels_bar={lab_bar.height} {path_b}")
-    typer.echo(f"labels_event={lab_event.height} {path_e}")
+    try:
+        lab_bar, lab_event = analyze_ticker.run_labels(
+            symbol=symbol,
+            timeframe=timeframe,
+            horizons=horizons,
+            cache_dir=Path(cache_dir),
+            export=export
+        )
+        typer.echo(f"labels_bar={lab_bar.height}")
+    except Exception as e:
+        raise typer.BadParameter(str(e))
 
 
 @validate_app.command("walkforward")
@@ -118,40 +133,20 @@ def validate_walkforward(
     cache_dir: str = "data",
     export: str = "parquet",
 ):
-    if model != "logistic":
-        raise typer.BadParameter("Modelo soportado en V1 mínima: logistic")
-    if mode not in {"rolling", "expanding"}:
-        raise typer.BadParameter("mode debe ser rolling o expanding")
-
-    feats = load_frame(dataset_path(Path(cache_dir), "features", symbol, timeframe))
-    events = load_frame(dataset_path(Path(cache_dir), "events", symbol, timeframe))
-    labels_event = load_frame(dataset_path(Path(cache_dir), "labels_event", symbol, timeframe))
-    ds = event_dataset(feats, events, labels_event, horizon=horizon)
-    X, y, fr, sub = as_xy(ds)
-    if len(y) < 20:
-        raise typer.BadParameter("Muy pocos eventos válidos para walk-forward")
-
-    folds = list(walk_forward_indices(len(y), mode=mode, train_size=50, test_size=20, n_splits=5, purge=1))
-    fold_rows = []
-    aucs = []
-    for i, fold in enumerate(folds):
-        Xtr, ytr = X[fold.train_idx], y[fold.train_idx]
-        Xte, yte = X[fold.test_idx], y[fold.test_idx]
-        frte = fr[fold.test_idx]
-        clf = fit_logistic(Xtr, ytr)
-        prob = clf.predict_proba(Xte)[:, 1]
-        m = compute_signal_metrics(yte, prob, frte)
-        aucs.append(m["auc"])
-        fold_rows.append({"fold": i, **m})
-
-    summary = compute_signal_metrics(y, fit_logistic(X, y).predict_proba(X)[:, 1], fr)
-    summary["stability_score"] = stability_score([x for x in aucs if x == x])
-    folds_df = pl.DataFrame(fold_rows)
-    summary_df = pl.DataFrame([summary])
-    _save(Path(cache_dir), "validation_folds", symbol, timeframe, folds_df, export=export)
-    out = _save(Path(cache_dir), "validation_summary", symbol, timeframe, summary_df, export=export)
-    print_metrics(summary)
-    typer.echo(f"validation={out} rows={sub.height}")
+    try:
+        result = analyze_ticker.run_validate(
+            symbol=symbol,
+            timeframe=timeframe,
+            model=model,
+            mode=mode,
+            horizon=horizon,
+            cache_dir=Path(cache_dir),
+            export=export
+        )
+        print_metrics(result["summary"])
+        typer.echo(f"validation={result['path']} rows={result['rows']}")
+    except Exception as e:
+        raise typer.BadParameter(str(e))
 
 
 @score_app.command("now")

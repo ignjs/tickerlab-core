@@ -3,14 +3,12 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tickerlab"
+name = "tickerlab-core"
 version = "0.1.0"
-description = "CLI cuantitativa para detección de patrones en tickers"
+description = "Motor cuantitativo para detección de patrones en tickers"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "typer>=0.12.3",
-  "rich>=13.7.1",
   "polars>=1.2.1",
   "pyarrow>=17.0.0",
   "numpy>=1.26.4",
@@ -23,11 +21,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cli = [
+  "typer>=0.12.3",
+  "rich>=13.7.1",
+]
 dev = [
   "pytest>=8.3.2",
   "hypothesis>=6.112.0",
   "pytest-benchmark>=4.0.0",
 ]
+
 
 [project.scripts]
 tickerlab = "tickerlab.cli.main:app"
