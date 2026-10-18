@@ -11,7 +11,13 @@ REQUIRED_OHLCV = ["ts", "open", "high", "low", "close", "volume"]
 
 def normalize_bars(df: pl.DataFrame, symbol: str, timeframe: str) -> pl.DataFrame:
     cols = {c.lower(): c for c in df.columns}
-    aliases = {"date": "ts", "timestamp": "ts", "adj close": "adj_close", "adjclose": "adj_close"}
+    aliases = {
+        "date": "ts",
+        "datetime": "ts",
+        "timestamp": "ts",
+        "adj close": "adj_close",
+        "adjclose": "adj_close",
+    }
     renames: dict[str, str] = {}
     for lower, original in cols.items():
         if lower in aliases:

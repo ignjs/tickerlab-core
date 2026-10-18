@@ -110,6 +110,31 @@ def normalize_symbol(symbol: str) -> tuple[str, str | None]:
     return clean, None
 
 
+def _serialize_chart_data(bars: pl.DataFrame, pivots: pl.DataFrame) -> tuple[list[dict], list[dict]]:
+    serialized_bars = (
+        bars.select(
+            pl.col("ts").dt.strftime("%Y-%m-%dT%H:%M:%S").alias("timestamp"),
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        )
+        .to_dicts()
+    )
+    serialized_pivots = []
+    if not pivots.is_empty():
+        serialized_pivots = (
+            pivots.select(
+                pl.col("ts").dt.strftime("%Y-%m-%dT%H:%M:%S").alias("timestamp"),
+                pl.col("pivot_type").alias("type"),
+                pl.col("price").alias("value"),
+            )
+            .to_dicts()
+        )
+    return serialized_bars, serialized_pivots
+
+
 def validate_yahoo_symbol(symbol: str, timeframe: str = "1d") -> tuple[bool, str | None]:
     """
     Verifica preventivamente que un símbolo exista en Yahoo Finance antes de
@@ -185,8 +210,11 @@ def analyze_ticker(
             suggestion = fuzzy_suggest_symbol(symbol)
             return {
                 "symbol": sym,
+                "timeframe": timeframe,
                 "note": note,
                 "quote": None,
+                "bars": [],
+                "pivots": [],
                 "bars_count": 0,
                 "events_count": 0,
                 "summary": None,
@@ -218,6 +246,7 @@ def analyze_ticker(
 
     # 4. Patrones y Pivots
     piv = detect_pivots(bars, window=3)
+    serialized_bars, serialized_pivots = _serialize_chart_data(bars, piv)
     events = scan_structural(piv, tolerance=0.01)
     save_frame(piv, dataset_path(cache_dir, "pivots", sym, timeframe))
     save_frame(events, dataset_path(cache_dir, "events", sym, timeframe))
@@ -235,8 +264,11 @@ def analyze_ticker(
     if len(y) < 20:
         return {
             "symbol": sym,
+            "timeframe": timeframe,
             "note": note,
             "quote": quote,
+            "bars": serialized_bars,
+            "pivots": serialized_pivots,
             "bars_count": bars.height,
             "events_count": events.height,
             "summary": None,
@@ -288,8 +320,11 @@ def analyze_ticker(
 
     return {
         "symbol": sym,
+        "timeframe": timeframe,
         "note": note,
         "quote": quote,
+        "bars": serialized_bars,
+        "pivots": serialized_pivots,
         "bars_count": bars.height,
         "events_count": events.height,
         "summary": summary,
